@@ -1,21 +1,13 @@
 # app.R
 # Nakad et al. (2023): Stomatal optimality, VPD response, and AFM (exploratory tool)
 #
-# This version is integrated + internally consistent with the *simplified* Nakad framework:
-#   - Eq. 9 (Fick: fc = g(ca-ci), fe ≈ a g D), Eq. 10 (linearized demand form used here),
-#     Eq. 12 (optimal g), Eq. 20 (optimal ci/ca), Eq. 21 (WUE), and simplified AFM Dafm expression.
-#   - Diagnostic mode: infer λ by direct inversion of Eq. 20 at VPDref and target ci/ca.
-#   - Adds H2O conductance: g_H2O = a * g_CO2.
-#   - Shows both: dashed = theory Dafm; dotted = numeric peak of fe within chosen VPD range.
-#   - Adds optional fixed y-axis limits for all curves (user-controlled).
-#
-# Unit conventions (internally consistent):
-#   - ca, alpha2, cp entered in ppm; converted to mol/mol using *1e-6
-#   - alpha1 entered in µmol m^-2 s^-1; converted to mol m^-2 s^-1 using *1e-6
-#   - VPD entered in kPa; converted to D (dimensionless mol/mol) via D = VPD/Patm
-#   - g_CO2 in mol CO2 m^-2 s^-1; g_H2O in mol H2O m^-2 s^-1 (equivalent conductance)
-#   - fc plotted in µmol CO2 m^-2 s^-1; fe plotted in mmol H2O m^-2 s^-1
-#   - WUE in mol CO2 / mol H2O
+# This version:
+#  - Keeps the simplified Nakad framework for VPD-response curves + AFM diagnostics.
+#  - Reports "true" marginal WUE as in Nakad/Katul:
+#      mWUE ≡ (∂f_c/∂f_e)|D = (∂f_c/∂g)/(∂f_e/∂g) = λ
+#    (shown as text + consistency check; not plotted vs VPD because it is constant here).
+#  - Adds a new tab: "A–Ci (Farquhar)" showing Ac (Rubisco limitation), Aj (RuBP limitation),
+#    and A = min(Ac,Aj) - Rd, with an operating Ci marker from the Nakad-optimality Ci/Ca at a chosen VPD.
 
 library(shiny)
 library(ggplot2)
@@ -31,6 +23,13 @@ vline_if_in_range <- function(x, xmin, xmax, linetype = "dashed") {
   } else {
     NULL
   }
+}
+
+# numeric derivative dy/dx (finite differences), returns same length as x (first NA)
+dydx_fd <- function(x, y) {
+  dx <- diff(x)
+  dy <- diff(y)
+  c(NA_real_, dy / dx)
 }
 
 # -------------------------
@@ -58,7 +57,7 @@ fe_from_g <- function(g_mol, D_molmol, a) {
   a * g_mol * D_molmol
 }
 
-# Eq. 20: optimal ci/ca (dimensionless)
+# Eq. 20: optimal ci/ca (dimensionless) -- valid in open-stomata regime
 ci_ca_opt <- function(D_molmol, ca_molmol, a, lambda) {
   D_molmol <- pmax(D_molmol, 1e-12)
   lambda <- pmax(lambda, 1e-12)
@@ -66,7 +65,6 @@ ci_ca_opt <- function(D_molmol, ca_molmol, a, lambda) {
 }
 
 # Invert Eq. 20 exactly to infer lambda from (ci/ca at Dref, ca):
-# ci/ca = 1 - sqrt(a*lambda/ca)*sqrt(D)
 # => lambda = (ca/(a*D))*(1 - ci/ca)^2
 lambda_from_ci_ca_eq20 <- function(ci_ca, D_molmol, ca_molmol, a) {
   D_molmol <- pmax(D_molmol, 1e-12)
@@ -88,28 +86,109 @@ D_afm_molmol <- function(ca_molmol, a, lambda) {
   (4/9) * (ca_molmol / a) * (1 / lambda)
 }
 
-# Eq. 16-like sign term (used in discussion; inputs in mol/mol)
+# Eq. 16-like sign term
 Ca_afm_coeff <- function(alpha2_prime_molmol, ca_molmol, cp_molmol) {
   - (alpha2_prime_molmol - 2 * ca_molmol + 2 * cp_molmol) / (alpha2_prime_molmol^2)
 }
 
-# numerical derivative d(fe)/d(VPD) (finite differences), VPD in kPa, fe in mmol m^-2 s^-1
-dfe_dVPD_numeric <- function(VPD_kPa, fe_mmol) {
-  dX <- diff(VPD_kPa)
-  dY <- diff(fe_mmol)
-  c(NA, dY / dX)
+# -------------------------
+# TRUE marginal WUE (Nakad/Katul): ∂fc/∂fe at fixed D
+# -------------------------
+# For fc = (g α1 ca)/(α1 + g B), B = α2 + s ca:
+# ∂fc/∂g = (α1^2 ca)/(α1 + gB)^2
+dfc_dg <- function(g_mol, ca_molmol, alpha1_mol, alpha2_molmol, s) {
+  B <- alpha2_molmol + s * ca_molmol
+  denom <- alpha1_mol + g_mol * B
+  (alpha1_mol^2 * ca_molmol) / (denom^2)
+}
+
+# fe = a g D => ∂fe/∂g = a D
+dfe_dg <- function(D_molmol, a) {
+  a * D_molmol
+}
+
+# -------------------------
+# Optional: Farquhar A–Ci (two limitations)
+# -------------------------
+# Inputs/outputs in ppm & µmol m^-2 s^-1 for plotting.
+farquhar_aci <- function(Ci_ppm,
+                         Vcmax, J, Rd,
+                         GammaStar_ppm,
+                         Kc_ppm, Ko_ppm, O2_ppm) {
+  
+  # Rubisco-limited (Ac)
+  Ac <- Vcmax * (Ci_ppm - GammaStar_ppm) / (Ci_ppm + Kc_ppm * (1 + O2_ppm / Ko_ppm))
+  
+  # RuBP-regeneration limited (Aj) common form
+  Aj <- J * (Ci_ppm - GammaStar_ppm) / (4 * Ci_ppm + 8 * GammaStar_ppm)
+  
+  A <- pmin(Ac, Aj) - Rd
+  
+  data.frame(Ci_ppm = Ci_ppm, Ac = Ac, Aj = Aj, A = A)
+}
+
+# -------------------------
+# Nakad Table 1 Vcmax(T)
+# -------------------------
+vcmax_T_table1 <- function(T_C, Vcmax25, m1, m2) {
+  Vcmax25 * exp(m1 * (T_C - 25)) *
+    (1 + exp(m2 * (T_C - 41)))^(-1)
+}
+
+# -------------------------
+# λ(REW) (drought)
+# -------------------------
+lambda_from_REW <- function(REW, lambda_wet, form = c("power","linear"), k = 1.5, beta = 2) {
+  form <- match.arg(form)
+  REW <- pmax(pmin(REW, 1), 1e-6)
+  
+  if (form == "power") {
+    # λ = λwet * REW^-k
+    lambda_wet * (REW^(-k))
+  } else {
+    # λ = λwet * (1 + β (1-REW))
+    lambda_wet * (1 + beta * (1 - REW))
+  }
 }
 
 # -------------------------
 # UI
 # -------------------------
-
 ui <- fluidPage(
+  
+  # Sticky sidebar CSS
+  tags$head(
+    tags$style(HTML("
+      #sidebar {
+        position: sticky;
+        top: 10px;
+        max-height: calc(100vh - 20px);
+        overflow-y: auto;
+      }
+    "))
+  ),
+  
   titlePanel("Nakad et al. (2023): Stomatal optimality, VPD response, and AFM (exploratory tool)"),
   
   sidebarLayout(
     sidebarPanel(
+      id = "sidebar",
       h4("Inputs"),
+      
+      hr(),
+      h4("Treatment presets"),
+      selectInput(
+        "preset",
+        "Treatment preset",
+        choices = c(
+          "Custom",
+          "Ambient (A)",
+          "Heat (H)",
+          "Drought (D)",
+          "Heat + Drought (H+D)"
+        ),
+        selected = "Custom"
+      ),
       
       sliderInput("ca_ppm", "Atmospheric CO₂, ca (ppm)", min = 250, max = 1000, value = 420, step = 10),
       
@@ -117,7 +196,7 @@ ui <- fluidPage(
       
       conditionalPanel(
         condition = "input.infer_lambda == false",
-        sliderInput("lambda_in", "λ (input; dimensionless in this simplified form)",
+        sliderInput("lambda_in", "λ (input; Lagrange multiplier; simplified units)",
                     min = 1e-5, max = 0.5, value = 0.03, step = 0.001)
       ),
       
@@ -137,12 +216,15 @@ ui <- fluidPage(
       
       sliderInput(
         "alpha2_ppm",
-        label = HTML("&alpha;<sub>2</sub> (ppm; e.g., K<sub>c</sub>(1+O/K<sub>o</sub>) under RuBisCO limitation)"),
+        label = HTML("&alpha;<sub>2</sub> (ppm; RuBisCO term like K<sub>c</sub>(1+O/K<sub>o</sub>) under RuBisCO limitation)"),
         min = 50, max = 1200, value = 550, step = 10
       ),
       
       sliderInput("s", "s (ci/ca linearization parameter)", min = 0.3, max = 0.9, value = 0.7, step = 0.01),
-      sliderInput("a", "a (H₂O/CO₂ diffusivity ratio)", min = 1.2, max = 2.0, value = 1.6, step = 0.01),
+      
+      sliderInput("a",
+                  HTML("a (diffusivity ratio D<sub>H2O</sub>/D<sub>CO2</sub>; used in f<sub>e</sub> = a·g<sub>CO2</sub>·D)"),
+                  min = 1.2, max = 2.0, value = 1.6, step = 0.01),
       
       sliderInput(
         "cp_ppm",
@@ -157,6 +239,28 @@ ui <- fluidPage(
       sliderInput("VPDmin", "VPD min (kPa)", min = 0, max = 5, value = 0.1, step = 0.05),
       sliderInput("VPDmax", "VPD max (kPa)", min = 0.2, max = 10, value = 5, step = 0.1),
       numericInput("npts", "Number of points", value = 500, min = 100, max = 2000, step = 50),
+      
+      hr(),
+      h4("Drought (soil water)"),
+      sliderInput("REW", "Relative extractable water (REW)", min = 0.05, max = 1, value = 1, step = 0.01),
+      selectInput("drought_fun", "λ(REW) form", choices = c("Power law" = "power", "Linear" = "linear"), selected = "power"),
+      numericInput("lambda_wet", "λ at REW = 1 (wet reference)", value = 0.008, min = 1e-5, max = 1, step = 0.001),
+      conditionalPanel(
+        condition = "input.drought_fun == 'power'",
+        numericInput("k_rew", "Drought sensitivity k (larger = stronger response)", value = 1.5, min = 0, max = 10, step = 0.1)
+      ),
+      conditionalPanel(
+        condition = "input.drought_fun == 'linear'",
+        numericInput("beta_rew", "Drought sensitivity β (λ = λwet*(1+β(1-REW)))", value = 2, min = 0, max = 20, step = 0.2)
+      ),
+      
+      hr(),
+      h4("Heat (temperature)"),
+      sliderInput("Tair_C", "Air/leaf temperature T (°C)", min = 0, max = 50, value = 25, step = 0.5),
+      checkboxInput("use_T_for_alpha1", "Use Table-1 Vcmax(T) for α1 (recommended)", value = TRUE),
+      numericInput("Vcmax25", "Vcmax,25 (µmol m⁻² s⁻¹)", value = 80, min = 1, max = 300, step = 1),
+      numericInput("m1", "m1 (°C⁻¹)", value = 0.08, min = 0, max = 0.3, step = 0.001),
+      numericInput("m2", "m2 (°C⁻¹)", value = 0.20, min = 0, max = 1, step = 0.01),
       
       hr(),
       h4("Axis limits"),
@@ -202,11 +306,25 @@ ui <- fluidPage(
       ),
       
       hr(),
+      h4("A–Ci (Farquhar) settings"),
+      sliderInput("VPD_for_aci", "VPD for operating Ci marker (kPa)", min = 0.1, max = 5, value = 1.0, step = 0.1),
+      sliderInput("Vcmax", "Vcmax (µmol m^-2 s^-1)", min = 10, max = 300, value = 80, step = 1),
+      sliderInput("J", "J (or Jmax proxy) (µmol m^-2 s^-1)", min = 10, max = 400, value = 140, step = 5),
+      sliderInput("Rd", "Rd (µmol m^-2 s^-1)", min = 0, max = 5, value = 1.0, step = 0.1),
+      sliderInput("GammaStar", HTML("&Gamma;* (ppm)"), min = 10, max = 80, value = 42, step = 1),
+      sliderInput("Kc", "Kc (ppm)", min = 50, max = 1500, value = 404, step = 10),
+      sliderInput("Ko", "Ko (ppm)", min = 10000, max = 500000, value = 278000, step = 5000),
+      sliderInput("O2", "O2 (ppm)", min = 150000, max = 230000, value = 210000, step = 1000),
+      
+      hr(),
       h4("Notes"),
       helpText(
         "We convert VPD (kPa) to D = VPD/Patm (dimensionless mol/mol) to keep Eq. 9 unit-consistent.",
-        "Transpiration proxy: fe ≈ a g D.",
-        "On fe plot: dashed = theory Dafm; dotted = numeric peak of fe in chosen range."
+        "Transpiration proxy: fe ≈ a g_CO2 D (where a≈1.6 accounts for diffusivity ratio).",
+        "AFM: dashed line is theory Dafm; dotted line is numeric peak of fe within chosen VPD range.",
+        "cp is used only for the Eq.16-like AFM sign diagnostic in this simplified implementation.",
+        "Eq.20-based ci/ca is shown in the open-stomata regime; when g=0 we set ci/ca → 1 (physical limit).",
+        "Marginal WUE in Nakad/Katul is defined as ∂fc/∂fe at fixed D, and equals λ."
       ),
       width = 4
     ),
@@ -229,7 +347,19 @@ ui <- fluidPage(
         ),
         tabPanel("AFM diagnostics",
                  plotOutput("p_dfe"),
-                 verbatimTextOutput("txt_afm")
+                 verbatimTextOutput("txt_afm"),
+                 hr(),
+                 verbatimTextOutput("txt_mwue")
+        ),
+        tabPanel("A–Ci (Farquhar)",
+                 plotOutput("p_aci", height = 450),
+                 helpText("Ac: Rubisco limitation; Aj: RuBP regeneration limitation; A = min(Ac,Aj) - Rd. Dashed vertical line marks Ci predicted by Nakad-optimality at the chosen VPD.")
+        ),
+        tabPanel("WUE geometry",
+                 plotOutput("p_wue_geom", height = 500),
+                 helpText("Solid curve: fc vs fe as VPD varies (solid: pre-AFM branch, dotted: post-AFM branch). 
+                  Dashed line: average slope (WUE = fc/fe at selected point). 
+                  Solid straight line: tangent slope (mWUE = λ).")
         )
       ),
       width = 8
@@ -240,7 +370,6 @@ ui <- fluidPage(
 # -------------------------
 # Server
 # -------------------------
-
 server <- function(input, output, session) {
   
   # y-limits (optional fixed axes)
@@ -269,20 +398,56 @@ server <- function(input, output, session) {
     c(min(input$wue_min, input$wue_max), max(input$wue_min, input$wue_max))
   })
   
+  
+  # -------------------------
+  # Treatment presets
+  # -------------------------
+  observeEvent(input$preset, {
+    if (input$preset == "Ambient (A)") {
+      updateSliderInput(session, "Tair_C", value = 25)
+      updateSliderInput(session, "REW", value = 1)
+    } else if (input$preset == "Heat (H)") {
+      updateSliderInput(session, "Tair_C", value = 30)
+      updateSliderInput(session, "REW", value = 1)
+    } else if (input$preset == "Drought (D)") {
+      updateSliderInput(session, "Tair_C", value = 25)
+      updateSliderInput(session, "REW", value = 0.4)
+    } else if (input$preset == "Heat + Drought (H+D)") {
+      updateSliderInput(session, "Tair_C", value = 30)
+      updateSliderInput(session, "REW", value = 0.4)
+    }
+  })
+  
   lambda_eff <- reactive({
+    
+    # 1) baseline λ (either inferred from ci/ca at VPDref OR user slider)
     ca_molmol <- input$ca_ppm * 1e-6
     
     if (!isTRUE(input$infer_lambda)) {
-      return(pmax(input$lambda_in, 1e-12))
+      lambda_base <- pmax(input$lambda_in, 1e-12)
+    } else {
+      Dref <- pmax(input$VPD_ref / input$patm_kPa, 1e-12)
+      lambda_base <- lambda_from_ci_ca_eq20(
+        ci_ca = input$ci_ca_ref,
+        D_molmol = Dref,
+        ca_molmol = ca_molmol,
+        a = input$a
+      )
+      lambda_base <- pmax(lambda_base, 1e-12)
     }
     
-    Dref <- pmax(input$VPD_ref / input$patm_kPa, 1e-12)
-    lam <- lambda_from_ci_ca_eq20(
-      ci_ca = input$ci_ca_ref,
-      D_molmol = Dref,
-      ca_molmol = ca_molmol,
-      a = input$a
+    # 2) treat lambda_base as "wet reference", then apply drought scaling by REW
+    # (alternatively you can set lambda_wet directly with input$lambda_wet)
+    lambda_wet <- if (!is.null(input$lambda_wet)) pmax(input$lambda_wet, 1e-12) else lambda_base
+    
+    lam <- lambda_from_REW(
+      REW = input$REW,
+      lambda_wet = lambda_wet,
+      form = input$drought_fun,
+      k = input$k_rew,
+      beta = input$beta_rew
     )
+    
     pmax(lam, 1e-12)
   })
   
@@ -304,7 +469,15 @@ server <- function(input, output, session) {
     alpha2_prime_molmol <- alpha2_molmol + ca_molmol
     
     # Convert alpha1 µmol -> mol
-    alpha1_mol <- input$alpha1_umol * 1e-6
+    # alpha1_mol <- input$alpha1_umol * 1e-6
+    
+    # Now alpha1 with heat effect
+    alpha1_umol_eff <- if (isTRUE(input$use_T_for_alpha1)) {
+      vcmax_T_table1(input$Tair_C, input$Vcmax25, input$m1, input$m2)
+    } else {
+      input$alpha1_umol
+    }
+    alpha1_mol <- alpha1_umol_eff * 1e-6
     
     lam <- lambda_eff()
     
@@ -313,6 +486,8 @@ server <- function(input, output, session) {
       a = input$a, lambda = lam,
       alpha1_mol = alpha1_mol, alpha2_molmol = alpha2_molmol, s = input$s
     )
+    
+    open <- gco2_mol > 0
     
     gh2o_mol <- input$a * gco2_mol
     
@@ -328,31 +503,43 @@ server <- function(input, output, session) {
     fc_umol <- fc_mol * 1e6   # µmol CO2 m^-2 s^-1
     fe_mmol <- fe_mol * 1e3   # mmol H2O m^-2 s^-1
     
-    # ci/ca from Eq. 20
+    # ci/ca from Eq. 20 in open-stomata regime; otherwise ci/ca -> 1 (physical limit)
     ci_ca_eq20 <- ci_ca_opt(D_molmol = D_molmol, ca_molmol = ca_molmol, a = input$a, lambda = lam)
+    ci_ca <- ifelse(open, ci_ca_eq20, 1.0)
     
     # WUE: flux ratio and Eq. 21
     wue_flux <- ifelse(fe_mol > 0, fc_mol / fe_mol, NA_real_)
     wue_eq21 <- wue_closed_eq21(D_molmol = D_molmol, ca_molmol = ca_molmol, a = input$a, lambda = lam)
     
-    dfe_dVPD <- dfe_dVPD_numeric(VPD_kPa, fe_mmol)
+    # AFM diagnostic derivative: use only open regime to avoid clamp artifacts
+    fe_mmol_open <- ifelse(open, fe_mmol, NA_real_)
+    dfe_dVPD <- dydx_fd(VPD_kPa, fe_mmol_open)
     
-    # numeric peak in selected range
-    i_peak <- which.max(fe_mmol)
-    VPD_peak <- VPD_kPa[i_peak]
+    # numeric peak in selected range (open regime)
+    fe_for_peak <- ifelse(open, fe_mmol, NA_real_)
+    i_peak <- which.max(fe_for_peak)
+    VPD_peak <- if (length(i_peak) == 0 || is.infinite(i_peak) || is.na(fe_for_peak[i_peak])) NA_real_ else VPD_kPa[i_peak]
+    
+    # TRUE marginal WUE (Nakad/Katul): ∂fc/∂fe|D = (∂fc/∂g)/(∂fe/∂g) = λ
+    dfc_dg_val <- dfc_dg(gco2_mol, ca_molmol, alpha1_mol, alpha2_molmol, input$s)
+    mwue_true <- ifelse(open, dfc_dg_val / dfe_dg(D_molmol, input$a), NA_real_)
+    mwue_resid <- mwue_true - lam
     
     data.frame(
       VPD_kPa = VPD_kPa,
       D_molmol = D_molmol,
+      open = open,
       gco2_mol = gco2_mol,
       gh2o_mol = gh2o_mol,
       fc_umol = fc_umol,
       fe_mmol = fe_mmol,
-      ci_ca = ci_ca_eq20,
+      ci_ca = ci_ca,
       wue = wue_flux,
       wue_closed = wue_eq21,
       dfe_dVPD = dfe_dVPD,
       VPD_peak = VPD_peak,
+      mwue_true = mwue_true,
+      mwue_resid = mwue_resid,
       alpha2_prime_molmol = alpha2_prime_molmol,
       cp_molmol = cp_molmol
     )
@@ -361,14 +548,18 @@ server <- function(input, output, session) {
   Dafm_kPa <- reactive({
     ca_molmol <- input$ca_ppm * 1e-6
     lam <- lambda_eff()
-    Dafm_m <- D_afm_molmol(ca_molmol = ca_molmol, a = input$a, lambda = lam)
-    Dafm_m * input$patm_kPa
+    D_afm_molmol(ca_molmol = ca_molmol, a = input$a, lambda = lam) * input$patm_kPa
+  })
+  
+  Dafm_D <- reactive({
+    ca_molmol <- input$ca_ppm * 1e-6
+    lam <- lambda_eff()
+    D_afm_molmol(ca_molmol = ca_molmol, a = input$a, lambda = lam)
   })
   
   # -------------------------
-  # Plots
+  # Plots: Curves
   # -------------------------
-  
   output$p_gco2 <- renderPlot({
     df <- model_df()
     xafm <- Dafm_kPa()
@@ -442,13 +633,13 @@ server <- function(input, output, session) {
     
     ggplot(df, aes(VPD_kPa, ci_ca)) +
       geom_line() +
-      geom_hline(yintercept = 0, linetype = "dotted") +
+      geom_hline(yintercept = 1, linetype = "dotted") +
       vline_if_in_range(xafm, xmin, xmax, "dashed") +
       coord_cartesian(xlim = c(xmin, xmax), ylim = ylim_cica()) +
       labs(
         x = "VPD (kPa)",
         y = expression(paste(c[i] / c[a], " (-)")),
-        title = "Optimal ci/ca vs VPD (Eq. 20)"
+        title = "ci/ca vs VPD (Eq. 20 in open regime; ci/ca→1 when g=0)"
       )
   })
   
@@ -456,19 +647,41 @@ server <- function(input, output, session) {
     df <- model_df()
     xafm <- Dafm_kPa()
     xmin <- min(df$VPD_kPa); xmax <- max(df$VPD_kPa)
+    lam <- lambda_eff()
     
     ggplot(df, aes(VPD_kPa)) +
-      geom_line(aes(y = wue)) +
-      geom_line(aes(y = wue_closed), linetype = "dotted") +
+      geom_line(aes(y = wue), size = 1) +
+      geom_line(aes(y = wue_closed), linetype = "dotted", size = 1) +
       vline_if_in_range(xafm, xmin, xmax, "dashed") +
+      
+      # Horizontal line showing λ (true marginal WUE)
+      geom_hline(yintercept = lam, linetype = "dotdash") +
+      
+      # Text annotation with λ value
+      annotate("text",
+               x = xmin + 0.05*(xmax - xmin),
+               y = lam,
+               label = paste0("mWUE = λ = ", signif(lam, 4)),
+               hjust = 0,
+               vjust = -0.5,
+               size = 5) +
+      
       coord_cartesian(xlim = c(xmin, xmax), ylim = ylim_wue()) +
       labs(
         x = "VPD (kPa)",
         y = expression(paste("WUE (mol CO"[2], " / mol H"[2], "O)")),
-        title = "WUE vs VPD (solid: fc/fe; dotted: Eq. 21)"
+        title = "WUE vs VPD (solid: fc/fe; dotted: Eq. 21; dotdash: λ = marginal WUE)"
+      ) +
+      theme(
+        axis.title = element_text(size = 14),
+        axis.text  = element_text(size = 12),
+        plot.title = element_text(size = 14)
       )
   })
   
+  # -------------------------
+  # AFM diagnostics
+  # -------------------------
   output$p_dfe <- renderPlot({
     df <- model_df()
     xafm <- Dafm_kPa()
@@ -484,7 +697,7 @@ server <- function(input, output, session) {
       labs(
         x = "VPD (kPa)",
         y = expression(paste("d f"[e], "/ d(VPD) (mmol m"^{-2}, " s"^{-1}, " kPa"^{-1}, ")")),
-        title = "AFM diagnostic (dashed: theory Dafm; dotted: numeric peak)"
+        title = "AFM diagnostic (open-regime derivative; dashed: theory Dafm; dotted: numeric peak)"
       )
   })
   
@@ -495,17 +708,21 @@ server <- function(input, output, session) {
     alpha2_prime_molmol <- alpha2_molmol + ca_molmol
     lam <- lambda_eff()
     
-    Dafm_m <- D_afm_molmol(ca_molmol = ca_molmol, a = input$a, lambda = lam)
+    Dafm_m <- Dafm_D()
     Dafm_k <- Dafm_m * input$patm_kPa
     
     cafm <- Ca_afm_coeff(alpha2_prime_molmol = alpha2_prime_molmol, ca_molmol = ca_molmol, cp_molmol = cp_molmol)
     
     df <- model_df()
     VPD_peak <- df$VPD_peak[1]
-    fe_peak <- max(df$fe_mmol, na.rm = TRUE)
+    fe_peak <- suppressWarnings(max(ifelse(df$open, df$fe_mmol, NA_real_), na.rm = TRUE))
+    if (!is.finite(fe_peak)) fe_peak <- NA_real_
     
     idx <- which(!is.na(df$dfe_dVPD) & df$dfe_dVPD <= 0)
     VPD_cross <- if (length(idx) > 0) df$VPD_kPa[min(idx)] else NA_real_
+    D_cross <- if (!is.na(VPD_cross)) VPD_cross / input$patm_kPa else NA_real_
+    
+    frac_open <- mean(df$open)
     
     cat("Mode:\n")
     cat(if (isTRUE(input$infer_lambda)) "  Diagnostic: λ inferred from Eq. 20 inversion\n" else "  Forward: λ set by slider\n")
@@ -513,26 +730,164 @@ server <- function(input, output, session) {
     
     if (isTRUE(input$infer_lambda)) {
       cat(sprintf("  ci/ca(ref) = %.3f at VPDref = %.2f kPa\n", input$ci_ca_ref, input$VPD_ref))
-      cat(sprintf("  (Dref = VPDref/Patm = %.6g)\n\n", input$VPD_ref / input$patm_kPa))
+      cat(sprintf("  Dref = VPDref/Patm = %.6g (mol/mol)\n\n", input$VPD_ref / input$patm_kPa))
     }
     
     cat("AFM lines and peak check:\n")
-    cat(sprintf("  Theory Dafm (D-units) = %.6g (mol/mol)\n", Dafm_m))
+    cat(sprintf("  Theory Dafm (D units) = %.6g (mol/mol)\n", Dafm_m))
     cat(sprintf("  Theory Dafm (kPa)     = %.3f kPa\n", Dafm_k))
-    cat(sprintf("  Numeric peak VPD      = %.3f kPa (max fe = %.3f mmol m^-2 s^-1)\n", VPD_peak, fe_peak))
+    cat(sprintf("  Numeric peak VPD      = %s kPa (max fe(open) = %s mmol m^-2 s^-1)\n",
+                ifelse(is.na(VPD_peak), "NA", sprintf("%.3f", VPD_peak)),
+                ifelse(is.na(fe_peak), "NA", sprintf("%.3f", fe_peak))))
     
     if (is.na(VPD_cross)) {
-      cat("  First d(fe)/dVPD <= 0  = not found in selected range\n\n")
+      cat("  First d(fe)/dVPD <= 0  = not found in selected range\n")
     } else {
-      cat(sprintf("  First d(fe)/dVPD <= 0  = %.3f kPa\n\n", VPD_cross))
+      cat(sprintf("  First d(fe)/dVPD <= 0  = %.3f kPa (D = %.6g mol/mol)\n", VPD_cross, D_cross))
     }
     
-    cat("Why theory Dafm may not equal numeric peak:\n")
-    cat("- Dafm is a simplified analytical onset estimate; plotted fe uses full g(D) expression plus truncation g>=0.\n")
+    cat("\nOpen-stomata regime check:\n")
+    cat(sprintf("  Fraction of VPD grid with g>0 = %.2f\n", frac_open))
+    if (frac_open < 0.25) {
+      cat("  WARNING: Most of the chosen VPD range is in the g=0 regime; theory comparisons may look odd.\n")
+    }
+    
+    cat("\nWhy theory Dafm may not equal numeric peak:\n")
+    cat("- Dafm is a simplified analytical onset estimate; fe uses full g(D) with truncation g>=0.\n")
     cat("- The peak is computed within a finite VPD window.\n")
     cat("- Therefore we show both (dashed: theory; dotted: numeric peak).\n\n")
     
     cat(sprintf("Eq.16-like coefficient Ca^afm = %.6g  (paper discussion uses Ca^afm < 0)\n", cafm))
+  })
+  
+  output$txt_mwue <- renderPrint({
+    df <- model_df()
+    lam <- lambda_eff()
+    
+    resid <- df$mwue_resid[df$open]
+    resid <- resid[is.finite(resid)]
+    
+    cat("Marginal WUE (Nakad/Katul definition):\n")
+    cat("  mWUE ≡ (∂f_c/∂f_e)|D = (∂f_c/∂g)/(∂f_e/∂g) = λ\n\n")
+    cat(sprintf("  λ used = %.6g\n", lam))
+    
+    if (length(resid) == 0) {
+      cat("\nConsistency check:\n")
+      cat("  No open-stomata points (g>0) in the selected VPD range.\n")
+      cat("  Try reducing VPDmax or λ, or increasing alpha1.\n")
+      return(invisible(NULL))
+    }
+    
+    cat("\nConsistency check (open-stomata regime):\n")
+    cat(sprintf("  max|mWUE - λ| = %.3e\n", max(abs(resid))))
+    cat(sprintf("  mean(mWUE - λ) = %.3e\n", mean(resid)))
+    cat(sprintf("  sd(mWUE - λ)   = %.3e\n", sd(resid)))
+    
+    cat("\nInterpretation:\n")
+    cat("  This is a local (partial) marginal tradeoff with respect to g at fixed D.\n")
+    cat("  It is the quantity referred to as marginal WUE in Katul et al. (2012) and Nakad et al. (2023).\n")
+  })
+  
+  # -------------------------
+  # A–Ci (Farquhar) page
+  # -------------------------
+  output$p_aci <- renderPlot({
+    # Ci range for curve (0..~1.2*Ca)
+    Ci_ppm <- seq(0, max(10, 1.2 * input$ca_ppm), length.out = 400)
+    Ci_ppm <- pmax(Ci_ppm, 1e-6)
+    
+    aci <- farquhar_aci(
+      Ci_ppm = Ci_ppm,
+      Vcmax = input$Vcmax,
+      J = input$J,
+      Rd = input$Rd,
+      GammaStar_ppm = input$GammaStar,
+      Kc_ppm = input$Kc,
+      Ko_ppm = input$Ko,
+      O2_ppm = input$O2
+    )
+    
+    # Operating Ci predicted by Nakad-optimality at chosen VPD
+    VPDk <- clamp(input$VPD_for_aci, min(input$VPDmin, input$VPDmax), max(input$VPDmin, input$VPDmax))
+    Dk <- pmax(VPDk / input$patm_kPa, 1e-12)
+    ca_molmol <- input$ca_ppm * 1e-6
+    lam <- lambda_eff()
+    ci_ca_k <- ci_ca_opt(D_molmol = Dk, ca_molmol = ca_molmol, a = input$a, lambda = lam)
+    ci_ca_k <- clamp(ci_ca_k, 0, 1)
+    Ci_oper_ppm <- ci_ca_k * input$ca_ppm
+    
+    dd <- rbind(
+      data.frame(Ci_ppm = aci$Ci_ppm, A = aci$A, type = "A = min(Ac,Aj) - Rd"),
+      data.frame(Ci_ppm = aci$Ci_ppm, A = aci$Ac, type = "Ac (Rubisco-limited)"),
+      data.frame(Ci_ppm = aci$Ci_ppm, A = aci$Aj, type = "Aj (RuBP-limited)")
+    )
+    
+    ggplot(dd, aes(Ci_ppm, A, color = type, linetype = type)) +
+      geom_line(size = 1) +
+      scale_color_manual(values = c(
+        "A = min(Ac,Aj) - Rd" = "black",
+        "Ac (Rubisco-limited)" = "grey20",
+        "Aj (RuBP-limited)" = "red"
+      )) +
+      geom_vline(xintercept = Ci_oper_ppm, linetype = "dashed") +
+      labs(
+        x = expression(paste(C[i], " (ppm)")),
+        y = expression(paste("A (", mu, "mol m"^{-2}, " s"^{-1}, ")")),
+        title = sprintf("A–Ci (Farquhar) with operating Ci marker (VPD = %.2f kPa)", VPDk)
+      ) +
+      theme(
+        legend.position = "bottom",
+        legend.text = element_text(size = 14),
+        legend.title = element_blank(),
+        axis.title = element_text(size = 14),
+        axis.text  = element_text(size = 12),
+        plot.title = element_text(size = 14)
+      )
+  })
+  
+  # -------------------------
+  # WUE geometry page
+  # -------------------------
+  output$p_wue_geom <- renderPlot({
+    df <- model_df()
+    lam <- lambda_eff()
+    
+    df_open <- df[df$open & is.finite(df$fe_mmol) & is.finite(df$fc_umol) & df$fe_mmol > 0, , drop=FALSE]
+    if (nrow(df_open) < 10) { plot.new(); text(0.5,0.5,"Not enough open points"); return() }
+    
+    # split at fe peak (avoids looping comb)
+    i_peak <- which.max(df_open$fe_mmol)
+    if (is.na(i_peak) || i_peak < 3) i_peak <- floor(nrow(df_open)/2)
+    df1 <- df_open[1:i_peak, , drop=FALSE]
+    df2 <- df_open[i_peak:nrow(df_open), , drop=FALSE]
+    
+    # choose tangent point on rising branch (pre-AFM)
+    idx_mid <- max(2, floor(nrow(df1)/2))
+    fe0 <- df1$fe_mmol[idx_mid]
+    fc0 <- df1$fc_umol[idx_mid]
+    
+    wue_avg <- fc0 / fe0
+    
+    fe_range <- range(df_open$fe_mmol, na.rm=TRUE)
+    fe_line <- seq(fe_range[1], fe_range[2], length.out = 100)
+    
+    lambda_plot <- lam * 1000  # mol/mol -> µmol/mmol
+    fc_tangent <- fc0 + lambda_plot * (fe_line - fe0)
+    fc_avgline <- wue_avg * fe_line
+    
+    ggplot() +
+      geom_line(data = df1, aes(fe_mmol, fc_umol), linewidth = 1.2) +
+      geom_line(data = df2, aes(fe_mmol, fc_umol), linewidth = 1.2, linetype = "dotted") +
+      geom_point(data = data.frame(fe0=fe0, fc0=fc0), aes(fe0, fc0), size = 3) +
+      geom_line(data = data.frame(fe_line=fe_line, fc_line=fc_avgline),
+                aes(fe_line, fc_line), inherit.aes=FALSE, linetype="dashed", linewidth=1) +
+      geom_line(data = data.frame(fe_line=fe_line, fc_line=fc_tangent),
+                aes(fe_line, fc_line), inherit.aes=FALSE, linewidth=1.2) +
+      labs(
+        x = expression(paste(f[e], " (mmol H"[2], "O m"^{-2}, " s"^{-1}, ")")),
+        y = expression(paste(f[c], " (", mu, "mol CO"[2], " m"^{-2}, " s"^{-1}, ")")),
+        title = "WUE geometry: average vs marginal (solid: pre-AFM, dotted: post-AFM)"
+      )
   })
 }
 
