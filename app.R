@@ -175,21 +175,6 @@ ui <- fluidPage(
       id = "sidebar",
       h4("Inputs"),
       
-      hr(),
-      h4("Treatment presets"),
-      selectInput(
-        "preset",
-        "Treatment preset",
-        choices = c(
-          "Custom",
-          "Ambient (A)",
-          "Heat (H)",
-          "Drought (D)",
-          "Heat + Drought (H+D)"
-        ),
-        selected = "Custom"
-      ),
-      
       sliderInput("ca_ppm", "Atmospheric CO₂, ca (ppm)", min = 250, max = 1000, value = 420, step = 10),
       
       checkboxInput("infer_lambda", "Infer λ from ci/ca (diagnostic mode; Eq. 20 inversion)", value = TRUE),
@@ -208,10 +193,17 @@ ui <- fluidPage(
                     min = 0.1, max = 5, value = 1.0, step = 0.1)
       ),
       
-      sliderInput(
-        "alpha1_umol",
-        label = HTML("&alpha;<sub>1</sub> (&mu;mol CO<sub>2</sub> m<sup>-2</sup> s<sup>-1</sup>; Vcmax-like)"),
-        min = 10, max = 200, value = 80, step = 1
+      conditionalPanel(
+        condition = "input.use_T_for_alpha1 == false",
+        sliderInput(
+          "alpha1_umol",
+          label = HTML("&alpha;<sub>1</sub> (&mu;mol CO<sub>2</sub> m<sup>-2</sup> s<sup>-1</sup>; Vcmax-like)"),
+          min = 10, max = 200, value = 80, step = 1
+        )
+      ),
+      conditionalPanel(
+        condition = "input.use_T_for_alpha1 == true",
+        helpText("α1 is computed from Vcmax(T) (Table 1). To use the α1 slider, uncheck the box below.")
       ),
       
       sliderInput(
@@ -226,12 +218,6 @@ ui <- fluidPage(
                   HTML("a (diffusivity ratio D<sub>H2O</sub>/D<sub>CO2</sub>; used in f<sub>e</sub> = a·g<sub>CO2</sub>·D)"),
                   min = 1.2, max = 2.0, value = 1.6, step = 0.01),
       
-      sliderInput(
-        "cp_ppm",
-        label = HTML("c<sub>p</sub> (CO<sub>2</sub> compensation point, ppm)"),
-        min = 0, max = 100, value = 40, step = 1
-      ),
-      
       sliderInput("patm_kPa", "Atmospheric pressure, Patm (kPa)", min = 80, max = 110, value = 101.3, step = 0.1),
       
       hr(),
@@ -239,6 +225,21 @@ ui <- fluidPage(
       sliderInput("VPDmin", "VPD min (kPa)", min = 0, max = 5, value = 0.1, step = 0.05),
       sliderInput("VPDmax", "VPD max (kPa)", min = 0.2, max = 10, value = 5, step = 0.1),
       numericInput("npts", "Number of points", value = 500, min = 100, max = 2000, step = 50),
+      
+      hr(),
+      h4("Treatment presets"),
+      selectInput(
+        "preset",
+        "Treatment preset",
+        choices = c(
+          "Custom",
+          "Ambient (A)",
+          "Heat (H)",
+          "Drought (D)",
+          "Heat + Drought (H+D)"
+        ),
+        selected = "Ambient"
+      ),
       
       hr(),
       h4("Drought (soil water)"),
@@ -264,7 +265,7 @@ ui <- fluidPage(
       
       hr(),
       h4("Axis limits"),
-      checkboxInput("fix_axes", "Fix y-axis limits (for comparisons)", value = FALSE),
+      checkboxInput("fix_axes", "Fix y-axis limits (for comparisons)", value = TRUE),
       
       conditionalPanel(
         condition = "input.fix_axes == true",
@@ -289,7 +290,7 @@ ui <- fluidPage(
           
           tags$strong("f_e limits"),
           numericInput("fe_min", "min (mmol H2O m^-2 s^-1)", value = 0, min = 0),
-          numericInput("fe_max", "max (mmol H2O m^-2 s^-1)", value = 20, min = 0),
+          numericInput("fe_max", "max (mmol H2O m^-2 s^-1)", value = 5, min = 0),
           
           tags$hr(),
           
@@ -311,7 +312,7 @@ ui <- fluidPage(
       sliderInput("Vcmax", "Vcmax (µmol m^-2 s^-1)", min = 10, max = 300, value = 80, step = 1),
       sliderInput("J", "J (or Jmax proxy) (µmol m^-2 s^-1)", min = 10, max = 400, value = 140, step = 5),
       sliderInput("Rd", "Rd (µmol m^-2 s^-1)", min = 0, max = 5, value = 1.0, step = 0.1),
-      sliderInput("GammaStar", HTML("&Gamma;* (ppm)"), min = 10, max = 80, value = 42, step = 1),
+      sliderInput("GammaStar", HTML("&Gamma;* (CO<sub>2</sub> compensation point, ppm)"), min = 10, max = 80, value = 42, step = 1),
       sliderInput("Kc", "Kc (ppm)", min = 50, max = 1500, value = 404, step = 10),
       sliderInput("Ko", "Ko (ppm)", min = 10000, max = 500000, value = 278000, step = 5000),
       sliderInput("O2", "O2 (ppm)", min = 150000, max = 230000, value = 210000, step = 1000),
@@ -420,9 +421,9 @@ server <- function(input, output, session) {
   
   lambda_eff <- reactive({
     
-    # 1) baseline λ (either inferred from ci/ca at VPDref OR user slider)
     ca_molmol <- input$ca_ppm * 1e-6
     
+    # baseline λ from inference or slider
     if (!isTRUE(input$infer_lambda)) {
       lambda_base <- pmax(input$lambda_in, 1e-12)
     } else {
@@ -436,10 +437,14 @@ server <- function(input, output, session) {
       lambda_base <- pmax(lambda_base, 1e-12)
     }
     
-    # 2) treat lambda_base as "wet reference", then apply drought scaling by REW
-    # (alternatively you can set lambda_wet directly with input$lambda_wet)
-    lambda_wet <- if (!is.null(input$lambda_wet)) pmax(input$lambda_wet, 1e-12) else lambda_base
+    # choose wet reference consistently
+    lambda_wet <- if (isTRUE(input$infer_lambda)) {
+      lambda_base
+    } else {
+      pmax(input$lambda_wet, 1e-12)
+    }
     
+    # apply drought scaling
     lam <- lambda_from_REW(
       REW = input$REW,
       lambda_wet = lambda_wet,
@@ -463,7 +468,7 @@ server <- function(input, output, session) {
     # Convert ppm -> mol/mol
     ca_molmol <- input$ca_ppm * 1e-6
     alpha2_molmol <- input$alpha2_ppm * 1e-6
-    cp_molmol <- input$cp_ppm * 1e-6
+    cp_molmol <- input$GammaStar * 1e-6
     
     # alpha2' used in Eq. 16-like term (paper defines alpha2' = alpha2 + ca)
     alpha2_prime_molmol <- alpha2_molmol + ca_molmol
@@ -704,7 +709,7 @@ server <- function(input, output, session) {
   output$txt_afm <- renderPrint({
     ca_molmol <- input$ca_ppm * 1e-6
     alpha2_molmol <- input$alpha2_ppm * 1e-6
-    cp_molmol <- input$cp_ppm * 1e-6
+    cp_molmol <- input$GammaStar * 1e-6
     alpha2_prime_molmol <- alpha2_molmol + ca_molmol
     lam <- lambda_eff()
     
